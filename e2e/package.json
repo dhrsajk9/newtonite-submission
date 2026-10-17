@@ -1,0 +1,14 @@
+{
+  "name": "newtonite-e2e",
+  "private": true,
+  "description": "Browser tests: run against a running app (docker compose up).",
+  "scripts": {
+    "test": "playwright test",
+    "install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
+}

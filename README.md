@@ -1,12 +1,12 @@
 # Newtonite Work Items
 
-An internal tool for tracking operational work (customer issues, incidents,
-payment investigations, compliance tasks, approvals), with team-based
-permissions, a full activity history, and safe handling of concurrent edits.
+An internal web application for coordinating operational work: customer issues,
+incidents, payment investigations, compliance requests and tasks that need
+approval. Every item has an owner, a status, a priority, a reason it exists, a next
+step and a complete history. Teams, roles and a workflow decide who may do what,
+and the system stays correct when many people act on the same item at once.
 
-> Status: **Step 5: web interface.** The backend and UI are complete; final polish follows.
-
-## Running it
+## Quick start
 
 Requirements: Docker Desktop.
 
@@ -14,84 +14,215 @@ Requirements: Docker Desktop.
 docker compose up --build
 ```
 
-Then open **<http://localhost:3000>** and pick a demo account on the login screen.
+Open **<http://localhost:3000>** and pick a demo account on the login screen
+(every password is `password123`). The first build takes a few minutes.
 
-The API's health check is at <http://localhost:3000/api/health>. You should see:
+Three containers run: **db** (PostgreSQL 16), **api** (the HTTP API, which also
+serves the web app) and **worker** (background jobs). On startup the database is
+migrated and filled with demo data: 3 teams, 8 people with different roles, and
+5,000 work items. Both steps are safe to repeat. `docker compose down -v` starts
+again from an empty database.
 
-```json
-{"status":"ok","database":"reachable","counts":{"users":8,"teams":3,"work_items":5000},
- "jobs":{"pending":0,"dead":0,"oldest_pending_seconds":null}}
+---
+
+## How this meets the brief
+
+### What a user can understand about an item
+
+| The brief asks that a user can see… | Where |
+|---|---|
+| what the item is and why it exists | Title, type and **Why it exists** on the item page |
+| its current state and importance | Status, the **workflow track**, and priority (colour *and* word) everywhere |
+| who is responsible for it | Owner on every row and on the item page |
+| what has happened previously | **History and comments**: every change, who made it, when, and why |
+| what requires attention next | **Next step** on each item, and the **Needs attention** dashboard |
+
+### The critical behaviours (the brief asks for at least three; all seven are covered)
+
+| Situation | How it is handled | Proven by |
+|---|---|---|
+| Simultaneous actions by multiple users | Every change locks the item's row for the length of one transaction, so concurrent requests queue for milliseconds. Two simultaneous claims: one wins, the other gets `409 ALREADY_CLAIMED` naming the winner. | `concurrency.test.ts` (9 simultaneous claims → 1 winner), e2e claim race |
+| Handling stale information | Each item has a `version`. Edits and workflow actions must send the version the user saw; if it changed, `409 VERSION_CONFLICT` returns the current item. | `concurrency.test.ts`, e2e edit conflict |
+| Preventing accidental duplicates | `Idempotency-Key` on create and comment, recorded in the same transaction as the work; a retry replays the original response. | `idempotency.test.ts` (5 simultaneous submits → 1 item), e2e retried create |
+| Enforcing workflow rules | A state machine defined as data; payment and compliance items need a lead's approval; nobody approves their own request (four-eyes); rejecting needs a reason. | `workflow.test.ts`, e2e rejection |
+| Reliable asynchronous processing | Notifications go through a transactional outbox and a separate worker: retries with backoff, dead jobs after 5 attempts, safe to run twice. | `worker.test.ts` |
+| Authorization at the resource level | Permission depends on your role **in the item's team**, plus ownership and four-eyes rules, all in one function. Other teams' items return 404. | `permissions.test.ts`, `authorization.test.ts`, e2e viewer test |
+| Reconciling optimistic UI with the server | Claim is shown instantly and rolled back if someone else won; a stale edit shows the other person's changes and lets the user keep theirs on top or discard. | e2e claim race and edit conflict |
+
+### The engineering areas the brief lists
+
+| Area | Where to look |
+|---|---|
+| Data modelling | `server/src/db/migrations/001_init.sql`: per-team roles on the membership, append-only history, database-enforced invariants (e.g. an item in progress must have an owner) |
+| API design | REST with one endpoint per workflow action (`/actions/claim`, `/actions/approve`…), not a generic status `PATCH`; one error shape with machine-readable codes (see [API](#api)) |
+| Frontend state management | Server data in TanStack Query's cache, filters in the URL, drafts in component state ([decision F](ENGINEERING_DECISIONS.md#f-frontend-server-state-in-a-query-cache-optimistic-only-where-its-safe)) |
+| Authorization | `server/src/permissions.ts`: the only place permissions are decided |
+| Concurrent operations | `server/src/items/service.ts`: every change goes through `mutateItem()` |
+| Error handling | `server/src/errors.ts` + a central handler: typed errors, consistent JSON, no internals leaked; the UI shows each error's meaning ("Ravi Kumar has already claimed this item.") |
+| Data consistency | Change + history entry + notification job commit in **one** transaction; database constraints catch application bugs |
+| Search and filtering | Server-side filters and Postgres full-text search, kept in the URL so views can be shared |
+| Application performance | Indexes matched to each query; cursor pagination (50 at a time); the dashboard asks for 8 rows per queue; nothing loads the whole dataset |
+| Maintainability | Rules live in one place each (permissions, workflow, errors); routes contain no business logic; tests describe behaviour in plain sentences |
+
+The reasoning and trade-offs behind all of this are in
+**[ENGINEERING_DECISIONS.md](ENGINEERING_DECISIONS.md)**.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  B["Browser<br/>React + TanStack Query"] -- "JSON over HTTP<br/>session cookie" --> A
+  subgraph A["API (Node + Fastify)"]
+    direction TB
+    R["routes<br/>validate input"] --> S["service<br/>lock row, check version<br/>permissions, workflow"]
+  end
+  S -- "one transaction:<br/>change + history + job" --> D[("PostgreSQL<br/>data, history, outbox, search")]
+  W["Worker<br/>(separate process)"] -- "SKIP LOCKED<br/>retry, backoff, dead" --> D
+  W -. "writes notifications" .-> D
 ```
 
-Three containers run: **db** (Postgres), **api** (HTTP server, which also serves the web app) and **worker**
-(background jobs: notifications and housekeeping). `jobs.pending` shows whether
-the worker is keeping up; `jobs.dead` counts jobs that failed permanently.
+What happens when someone claims an item:
 
-On startup the API container applies database migrations and seeds demo data.
-Both steps are safe to repeat, so restarting never duplicates data.
+```mermaid
+sequenceDiagram
+  participant U as Ravi's browser
+  participant API
+  participant DB as PostgreSQL
+  participant W as Worker
+  U->>U: show "claimed by me" immediately (optimistic)
+  U->>API: POST /api/items/42/actions/claim
+  API->>DB: BEGIN, then SELECT ... FOR UPDATE (others wait here)
+  API->>API: visible? allowed? still unassigned?
+  API->>DB: UPDATE item, version + 1
+  API->>DB: INSERT history event + outbox job
+  API->>DB: COMMIT (lock released)
+  API-->>U: 200 + item: the server's answer replaces the optimistic one
+  Note over U,API: Meera's identical request, queued behind the lock,<br/>now sees an owner and gets 409 "Ravi Kumar has already claimed this item."
+  W->>DB: take job (FOR UPDATE SKIP LOCKED)
+  W->>DB: create notifications (unique per person + event)
+```
 
-To start again with an empty database: `docker compose down -v` (the `-v` deletes the data volume).
+---
 
-## Running the tests
+## Things to try
 
-Tests run against a real Postgres, in a separate `newtonite_test` database that is
-wiped and rebuilt on every run. Your demo data is never touched.
+Use two browser windows side by side, one of them private, so each has its own login.
+
+1. **Claim race.** Ravi and Meera open the same OPEN Payments item. Ravi clicks **Claim**, then Meera does. Meera's screen rolls back and says *"Ravi Kumar has already claimed this item."*
+2. **Edit conflict.** Asha (lead) and Ravi (owner) both click **Edit** on the same item. Ravi changes the priority and saves; then Asha saves her description change. Asha sees *"Someone else saved first"* with Ravi's change listed, and chooses to keep her changes on top of his or discard them.
+3. **Approval and four-eyes.** As Ravi, claim a **Payment** item: there is no **Resolve** button, only **Request approval**. Arjun's bell shows the request; he can **Approve** or **Reject…** (a reason is required). Asha can never approve her own requests.
+4. **Permissions.** Vikram (Engineering viewer) sees no create button and no actions, and a Payments item link shows "Item not found".
+5. **Scale.** **All items** browses 5,000 items 50 at a time, with filters and text search kept in the URL.
+
+## Demo users
+
+Every password is `password123`. Roles are per team, deliberately mixed.
+
+| User | Email | Payments | Customer Support | Engineering |
+|---|---|---|---|---|
+| Asha Rao | asha@newtonite.test | lead | viewer | — |
+| Arjun Mehta | arjun@newtonite.test | lead | — | lead |
+| Ravi Kumar | ravi@newtonite.test | member | — | — |
+| Meera Iyer | meera@newtonite.test | member | — | member |
+| Priya Nair | priya@newtonite.test | viewer | member | — |
+| Kabir Shah | kabir@newtonite.test | — | lead | — |
+| Neha Gupta | neha@newtonite.test | — | member | member |
+| Vikram Singh | vikram@newtonite.test | — | — | viewer |
+
+| Role | Can |
+|---|---|
+| viewer | see the team's items |
+| member | also create, comment, claim, and change items **they own** |
+| lead | also change any item in the team, assign, approve or reject (never their own request), close, reopen |
+
+---
+
+## Tests
+
+Tests target the behaviours that would be dangerous if wrong, not a coverage
+number. Every safety mechanism was checked by deliberately removing it (the row
+lock, the version check, the atomic idempotency insert, `SKIP LOCKED`, the job
+savepoint, the UI's idempotency key, correct logout): each time, the matching test
+failed, and it passed again once the mechanism was restored.
+
+### API and database tests (76)
+
+Run against a real PostgreSQL, in a separate `newtonite_test` database that is
+wiped on every run; demo data is never touched.
 
 ```bash
-docker compose up -d db                 # if it isn't already running
 docker compose run --rm --build api npm test
 ```
 
-Or, with Node 22+ installed: `cd server && npm install && npm test`
-(uses `localhost:5432`, which Docker Compose exposes).
-
-Tests focus on behaviour that would be dangerous if wrong, not on coverage:
-
 | File | What it proves |
 |---|---|
-| `test/permissions.test.ts` | The full role × action matrix; members can only change their own items; four-eyes rule; roles don't leak across teams |
-| `test/auth.test.ts` | Login, httpOnly cookie, identical errors for wrong password vs unknown email, logout revokes the session |
-| `test/authorization.test.ts` | Calling the API directly: outsiders get the same 404 as for a non-existent item |
-| `test/concurrency.test.ts` | 9 simultaneous claims → exactly one winner; stale edits rejected with 409; 5 simultaneous saves → one succeeds; failed requests leave no history |
-| `test/workflow.test.ts` | Invalid transitions (422); approval flow; four-eyes rule; reject needs a reason; ownership; assignment rules; `allowed_actions` per user |
-| `test/items.test.ts` | Validation; team scoping of lists; filters; text search; cursor pagination is complete and stable while data changes |
-| `test/idempotency.test.ts` | A retry returns the original response; 5 simultaneous submissions with one key create one item; a reused key with a different body is rejected; keys are per user; a failed request doesn't use up its key |
-| `test/dashboard.test.ts` | Approval requests reach other leads but never the requester; queues contain only what they claim to; everything is limited to your teams |
-| `test/worker.test.ts` | Notifications reach the right people (and never the actor); a failed action creates no job; a job run twice gives one notification; retry with backoff; partial writes undone; dead after 5 attempts; parallel workers never share a job; notifications API |
+| `concurrency.test.ts` | 9 simultaneous claims → exactly one winner; stale edits rejected and nothing overwritten; 5 simultaneous saves → one succeeds; failed requests leave no history |
+| `idempotency.test.ts` | A retry returns the original response; 5 simultaneous submissions with one key → one item; a key reused for a different request is rejected; keys are per user; a failed request doesn't use up its key |
+| `workflow.test.ts` | Invalid transitions (422); the approval flow; four-eyes; rejection needs a reason; members can't change others' items; assignment rules; `allowed_actions` per person |
+| `worker.test.ts` | The right people are notified (never the actor); a failed action creates no job; a job run twice → one notification; retry with backoff; partial writes undone; dead after 5 attempts; parallel workers never share a job |
+| `permissions.test.ts` | Every role × every action; ownership; four-eyes; no role leaks across teams |
+| `authorization.test.ts` | Calling the API directly: another team's item gets the same 404 as a missing one |
+| `auth.test.ts` | Login, httpOnly cookie, identical errors for wrong password and unknown email, logout revokes the session |
+| `items.test.ts` | Validation; lists only show your teams; filters; search; pagination visits every item once and stays stable while data changes |
+| `dashboard.test.ts` | Approval requests reach other leads, never the requester; each queue contains only what it claims to |
 
-The safety mechanisms were each checked by deliberately removing them (the row
-lock, the version check, the atomic idempotency insert, `SKIP LOCKED`, the job
-savepoint): in every case the matching test fails without it and passes with it.
+### Browser tests (6)
+
+End-to-end runs in Chromium, with several people logged in at once. They run
+against the running app, so start it first (`docker compose up`), then:
+
+```bash
+cd e2e
+npm install
+npx playwright install chromium   # first time only
+npm test
+```
+
+They cover: the claim race, the edit conflict, a create request delivered twice,
+rejection needing a reason, a viewer's and an outsider's view, and logging out
+then in as someone else.
+
+---
+
+## The web interface
+
+| Screen | What it does |
+|---|---|
+| **Needs attention** | Four short queues: assigned to you, waiting for your approval, unclaimed and urgent, overdue. Up to 8 items each, with the total. |
+| **All items** | Filters (team, status, priority, type, assignee) and text search, all in the URL; 50 items at a time with "Load 50 more". |
+| **Item** | Workflow track; why it exists and next step; your available actions; edit form; history and comments. |
+| **New item** | Creates an item; the form carries an idempotency key, so a duplicate submission creates it once. |
+| **Bell** | Unread notifications, refreshed every 15 seconds. |
+
+- Only the actions the server lists in `allowed_actions` are shown, and the server re-checks every request.
+- Screens refresh every 15–30 s and when the window regains focus. Correctness does not depend on this: versions catch anything stale.
+- Keyboard focus is always visible, dialogs are native `<dialog>` elements, form errors appear after interaction and are announced to screen readers, priority is never shown by colour alone, and the layout works on a phone.
+
+---
 
 ## API
 
-All errors share one shape: `{ "error": { "code": "...", "message": "..." } }`.
-
-**Idempotency.** `POST /api/items` and `POST /api/items/:id/comments` accept an
-`Idempotency-Key` header (8–128 letters, digits, `-`, `_`). Send the same key on
-every retry of one user action: a repeat returns the original response (with
-`Idempotent-Replayed: true`) instead of creating a duplicate. Keys are per user
-and remembered for 24 hours. Workflow actions don't need one: a repeated claim is
-harmless, and every other action carries a `version`, so a repeat gets 409.
+Every error has one shape: `{ "error": { "code": "...", "message": "...", ... } }`.
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/api/auth/login` | `{ email, password }` → user + teams/roles; sets session cookie |
+| POST | `/api/auth/login` | `{ email, password }` → user with teams and roles; sets the session cookie |
 | POST | `/api/auth/logout` | revokes the session |
-| GET | `/api/auth/me` | current user + teams/roles |
-| GET | `/api/items` | list; filters `team`, `status`, `priority`, `type` (comma-separated), `assignee` (`me`, `unassigned`, id), `q` (text search), `limit`, `cursor` → `{ items, nextCursor }` |
-| POST | `/api/items` | create → 201 |
-| GET | `/api/items/:id` | item + `allowed_actions` for you. 404 if it doesn't exist **or** belongs to a team you're not in |
-| PATCH | `/api/items/:id` | edit `title`, `description`, `priority`, `next_step`, `due_at`. **Requires `version`**; 409 if stale |
+| GET | `/api/auth/me` | current user with teams and roles |
+| GET | `/api/dashboard` | queues `mine`, `approvals`, `unclaimed`, `overdue`, each `{ items, total }` |
+| GET | `/api/items` | filters `team`, `status`, `priority`, `type` (comma-separated), `assignee` (`me`, `unassigned`, id), `q` (text), `limit`, `cursor` → `{ items, nextCursor }` |
+| POST | `/api/items` | create → 201. Accepts `Idempotency-Key` |
+| GET | `/api/items/:id` | item + your `allowed_actions`. 404 if missing **or** in a team you're not in |
+| PATCH | `/api/items/:id` | edit `title`, `description`, `priority`, `next_step`, `due_at`. **Requires `version`** |
 | POST | `/api/items/:id/actions/:action` | workflow actions (below). All except `claim` require `version` |
-| POST | `/api/items/:id/comments` | `{ body }` → 201 |
+| POST | `/api/items/:id/comments` | `{ body }` → 201. Accepts `Idempotency-Key` |
 | GET | `/api/items/:id/activity` | history, newest first; `limit`, `cursor` |
-| GET | `/api/dashboard` | the four "Needs attention" queues: `mine`, `approvals`, `unclaimed`, `overdue` (each `{ items, total }`) |
 | GET | `/api/teams/:id/members` | for assignment pickers |
-| GET | `/api/notifications` | your latest notifications + `unreadCount`; `unread=true`, `limit` |
-| POST | `/api/notifications/:id/read` | mark one read (404 if it isn't yours) |
-| POST | `/api/notifications/read-all` | mark all read |
-| GET | `/api/health` | liveness + database check |
+| GET | `/api/notifications` | latest notifications + `unreadCount` |
+| POST | `/api/notifications/:id/read`, `/api/notifications/read-all` | mark read |
+| GET | `/api/health` | database check + background job counts (`pending`, `dead`) |
 
 ### Workflow
 
@@ -108,168 +239,119 @@ OPEN ──claim/assign──► IN_PROGRESS ──request_approval──► AWA
 
 | Action | Who | Body |
 |---|---|---|
-| `claim` | member/lead of the team | none (succeeds only if unassigned; repeating it is harmless) |
-| `assign` | lead | `version`, `assignee_id` (must be a member/lead of the team) |
-| `unassign`, `request_approval`, `resolve` | the assignee, or a lead | `version` (`unassign` takes an optional `reason`) |
-| `approve` | a lead **other than the requester** | `version` |
-| `reject` | a lead other than the requester | `version`, `reason` (required) |
+| `claim` | member or lead | none; succeeds only if unassigned; repeating it is harmless |
+| `assign` | lead | `version`, `assignee_id` (a member or lead of the team) |
+| `unassign`, `request_approval`, `resolve` | the owner, or a lead | `version` |
+| `approve` | a lead other than the requester | `version` |
+| `reject`, `reopen` | a lead (reject: not the requester) | `version`, `reason` (required, kept in history) |
 | `close` | lead | `version` |
-| `reopen` | lead | `version`, `reason` (required) |
 
 `payment` and `compliance` items cannot be resolved directly; they must be approved.
-Status and assignee can only change through these actions, never through `PATCH`.
 
 | Status | Meaning |
 |---|---|
-| 400 | malformed request (`VALIDATION_ERROR`, with the bad fields listed) |
+| 400 | malformed request (`VALIDATION_ERROR`, listing the bad fields) |
 | 401 | not logged in |
 | 403 | you can see the item but may not do this |
-| 404 | not found, or not in your teams |
-| 409 | `VERSION_CONFLICT` (response includes the `current` item) or `ALREADY_CLAIMED` (includes who claimed it) |
-| 422 | breaks a business rule: `INVALID_TRANSITION`, `APPROVAL_REQUIRED`, `INVALID_ASSIGNEE`, `ITEM_CLOSED`, `IDEMPOTENCY_KEY_REUSED` |
+| 404 | not found, or in a team you're not in |
+| 409 | `VERSION_CONFLICT` (includes the `current` item) or `ALREADY_CLAIMED` (includes who) |
+| 422 | breaks a rule: `INVALID_TRANSITION`, `APPROVAL_REQUIRED`, `INVALID_ASSIGNEE`, `ITEM_CLOSED`, `IDEMPOTENCY_KEY_REUSED` |
 
-### Notifications
+### Who gets notified
 
-| Event | Who is notified |
+| Event | Notified |
 |---|---|
-| assigned | the new assignee |
-| unassigned | the previous assignee |
+| assigned / unassigned | the new / previous owner |
 | approval requested | every lead of the team |
-| approved / rejected | whoever requested approval (rejection includes the reason) |
-| commented | the assignee and the creator |
-| resolved / closed / reopened | the assignee |
+| approved / rejected | whoever asked for approval (with the reason) |
+| commented | the owner and the creator |
+| resolved / closed / reopened | the owner |
 
-The person who acted is never notified about their own action.
+Nobody is notified about their own action.
 
-## Things to try
-
-Open two browser windows side by side (one normal, one private, so each has its own login):
-
-1. **Claim race.** Log in as Ravi in one window and Meera in the other, and open the same OPEN Payments item. Ravi clicks **Claim**, then Meera clicks **Claim**. Meera's screen rolls back and says *"Ravi Kumar has already claimed this item."*
-2. **Edit conflict.** As Asha (lead) and Ravi (owner), both click **Edit** on the same item. Ravi changes the priority and saves; then Asha saves her description change. Asha sees *"Someone else saved first"* with Ravi's change listed, and chooses to keep her changes on top of his, or discard them.
-3. **Approval and four-eyes.** As Ravi, claim a **Payment** item: there is no **Resolve** button, only **Request approval**. As Arjun, the bell shows the request; open it and **Approve** or **Reject…** (a reason is required). Asha cannot approve her own requests.
-4. **Permissions.** Log in as Vikram (Engineering viewer only): no create button, no actions, and Payments items return "Item not found".
-5. **Scale.** **All items** lists 5,000 items 50 at a time; filter by status and priority, search by words, and every filter is in the URL so the view can be bookmarked.
-
-## Demo users
-
-Every user's password is `password123`. Roles are per team, deliberately mixed
-so permission rules can be demonstrated.
-
-| User | Email | Payments | Customer Support | Engineering |
-|---|---|---|---|---|
-| Asha Rao | asha@newtonite.test | lead | viewer | — |
-| Ravi Kumar | ravi@newtonite.test | member | — | — |
-| Meera Iyer | meera@newtonite.test | member | — | member |
-| Kabir Shah | kabir@newtonite.test | — | lead | — |
-| Priya Nair | priya@newtonite.test | viewer | member | — |
-| Arjun Mehta | arjun@newtonite.test | lead | — | lead |
-| Neha Gupta | neha@newtonite.test | — | member | member |
-| Vikram Singh | vikram@newtonite.test | — | — | viewer |
+---
 
 ## Project layout
 
 ```
-docker-compose.yml        Postgres + API + worker (built from server/Dockerfile, which also builds web/)
-web/
-  src/
-    api.ts                the only place the UI talks to the server; typed errors
-    App.tsx               login gate, layout, routes
-    pages/                Login, Dashboard, ItemList, ItemDetail, NewItem
-    components/           ActionPanel (optimistic claim), EditForm (conflict handling),
-                          Timeline, WorkflowTrack, NotificationBell, PromptDialog, Toast
-    format.ts             labels and dates in one place
-    styles.css            the whole visual design
+docker-compose.yml        db + api + worker (built by server/Dockerfile, which also builds web/)
+ENGINEERING_DECISIONS.md  the key decisions and their trade-offs
 server/
   src/
-    app.ts                builds the app: plugins, routes, central error handler
-    index.ts              starts the server
-    config.ts             settings from environment variables
-    errors.ts             typed errors → consistent JSON error responses
-    permissions.ts        ALL authorization rules: can() / authorize()
-    auth/                 login, logout, sessions, requireAuth guard
+    app.ts                assembles the API: plugins, routes, central error handler, serves the UI
+    permissions.ts        every authorization rule: can() / authorize()
+    errors.ts             typed errors → one JSON error shape
+    idempotency.ts        Idempotency-Key handling, atomic with the request's work
     items/
-      routes.ts           HTTP layer: validation and response shapes only
       service.ts          business logic; every change goes through mutateItem()
       workflow.ts         the state machine, as data
-      events.ts           activity history (written in the same transaction)
-      repository.ts       queries, cursor pagination, timeline
-    teams/                team members endpoint
-    notifications/        list / mark-read endpoints
-    dashboard/            the four "Needs attention" queues
-    idempotency.ts        Idempotency-Key handling, atomic with the request's work
+      events.ts           history + outbox jobs, in the change's transaction
+      routes.ts           HTTP only: validation and response shapes
+      repository.ts       queries, cursor pagination, history
     worker/
-      index.ts            the worker process: polls the queue, runs housekeeping
-      queue.ts            job processing: SKIP LOCKED, retries with backoff, dead jobs
-      notify.ts           turns an activity event into notifications (idempotent)
+      queue.ts            job processing: SKIP LOCKED, backoff, dead jobs
+      notify.ts           turns an event into notifications (safe to repeat)
+      index.ts            the worker process
+    auth/ teams/ notifications/ dashboard/   smaller route groups
     db/
-      pool.ts             connection pool + withTransaction helper
-      migrate.ts          applies migrations/*.sql in order, exactly once
-      seed.ts             demo teams, users and 5,000 work items
-      migrations/
-        001_init.sql      the schema
-        002_sessions.sql  login sessions
-        003_open_items_unassigned.sql   rule: OPEN items have no assignee
-        004_overdue_index.sql           partial index for the Overdue queue
-  test/                   integration + unit tests (real Postgres)
-ENGINEERING_DECISIONS.md  key design decisions and trade-offs
+      migrations/         001 schema · 002 sessions · 003 OPEN means unassigned · 004 overdue index
+      migrate.ts          applies each migration once, under a lock
+      seed.ts             demo teams, people and 5,000 items
+  test/                   76 tests against a real PostgreSQL
+web/
+  src/
+    api.ts                the only place the UI talks to the server
+    components/           ActionPanel (optimistic claim), EditForm (conflicts), Timeline,
+                          WorkflowTrack, NotificationBell, PromptDialog, Toast
+    pages/                Login, Dashboard, ItemList, ItemDetail, NewItem
+    styles.css            the whole visual design
+e2e/                      6 browser tests (Playwright)
 ```
 
-## Running without Docker (optional)
+## Running without Docker
 
-With Node 22+ and Postgres running (e.g. `docker compose up -d db`), use three terminals:
+With Node 22+ and PostgreSQL running (e.g. `docker compose up -d db`), in three terminals:
 
 ```bash
 cd server && npm install && npm run setup && npm run dev   # API on :3000
 cd server && npm run worker                                # background jobs
-cd web && npm install && npm run dev                       # UI on :5173, with hot reload
+cd web && npm install && npm run dev                       # UI on :5173, hot reload
 ```
 
-Open <http://localhost:5173>. The UI's dev server forwards `/api` to `:3000`.
+Open <http://localhost:5173>; the UI's dev server forwards `/api` to `:3000`.
 
-## The web interface
-
-| Screen | What it does |
-|---|---|
-| **Needs attention** | Four short queues: assigned to you, waiting for your approval, unclaimed and urgent, overdue. Each shows up to 8 items and the total. |
-| **All items** | Server-side filters (team, status, priority, type, assignee) and text search, all kept in the URL; 50 items at a time with "Load 50 more". |
-| **Item** | The workflow track, description and next step, the actions you are allowed to take, an edit form, and the history and comments. |
-| **New item** | Creates an item; the form carries an idempotency key, so double-submitting creates it once. |
-| **Bell** | Unread notifications, refreshed every 15 seconds. |
-
-How the UI handles server decisions:
-
-- **Server data lives in TanStack Query's cache;** filters live in the URL; drafts live in component state.
-- **Optimistic claim:** the page shows you as owner immediately; if someone else won, it rolls back and says who.
-- **Stale edits:** the edit form remembers the version it started from. A 409 shows what the other person changed and lets you keep your changes on top of theirs or discard them; nothing is overwritten silently.
-- **Freshness:** items, history and notifications re-fetch every 15 to 30 seconds and when the window regains focus.
-- **Buttons come from the server:** only actions in `allowed_actions` are shown, and the server re-checks every request anyway.
-- **Accessibility:** keyboard focus is always visible, dialogs are native `<dialog>` elements (Escape closes them), form errors appear after interaction and are announced to screen readers, priority is shown by word as well as colour, and the layout works on a phone.
+---
 
 ## Assumptions
 
-The brief leaves much unspecified on purpose. Assumptions made so far:
+The brief leaves much open on purpose. Decisions made:
 
-- **Every work item belongs to exactly one team.** That team's membership decides who can see and change it.
-- **Roles are per team:** `viewer` (read only), `member` (create, claim, work on items), `lead` (assign, approve, close).
-- **Workflow:** `OPEN → IN_PROGRESS → (AWAITING_APPROVAL →) RESOLVED → CLOSED`, with reopen and reject paths. `CLOSED` is final.
-- **OPEN means nobody owns it yet.** Claiming or assigning moves an item to `IN_PROGRESS`.
-- **Payment and compliance items need a lead's approval** before they are resolved, and the requester cannot approve their own request (four-eyes rule).
-- **Comments don't change the item's version**, so commenting never makes someone else's edit conflict.
-- **Items are never deleted.** They are closed, so history is preserved.
-- **Authentication is deliberately simple** (seeded users, password login). A real deployment would use company SSO.
+- **Every item belongs to exactly one team**, whose membership decides who can see and change it.
+- **Roles are per team:** viewer, member, lead (see [Demo users](#demo-users)).
+- **OPEN means nobody owns it yet.** Claiming or assigning moves an item to IN_PROGRESS.
+- **Payment and compliance items need a lead's approval**, and never the requester's own (four-eyes).
+- **CLOSED is final;** RESOLVED items can be reopened by a lead, with a reason.
+- **Items and comments are never deleted**, so history stays complete.
+- **Comments don't change an item's version**, so commenting never makes someone's edit conflict.
+- **Login is deliberately simple** (seeded people, password). A real deployment would use company SSO.
 
 ## Known limitations
 
-- **No login rate limiting or account lockout.** Production would rate-limit `/api/auth/login` per IP and per account.
-- **Expired sessions are ignored but not deleted.** A periodic cleanup job would remove them.
-- **No user or team administration UI.** Users, teams and roles come from seed data.
-- **Lists have one sort order** (most recently updated first) and **no total count**. Counting every match is slow on large tables; the dashboard (a later step) uses targeted queues instead.
-- **Comments cannot be edited or deleted.** Intentional for an audit trail, but a real product might allow edits with history.
+- **Updates appear within 15–30 seconds, not instantly** (polling). Version checks keep it correct; push updates are next on the list.
+- **Search results are ordered by most recently updated**, not by relevance.
+- **Lists show no total count**; counting every match is slow on large tables, so the dashboard uses targeted queues instead.
+- **Conflicts are resolved by the user**, with the other person's changes shown; there is no automatic field merging.
+- **No login rate limiting** and no CSRF tokens beyond `SameSite=Lax` cookies and a JSON-only API. Cookies are only marked `Secure` when `SECURE_COOKIES=true` (the demo runs on plain http).
+- **No admin screens:** users, teams and roles come from seed data; dead jobs are inspected with SQL (`SELECT * FROM outbox_jobs WHERE status = 'dead'`).
+- **The worker handles one job per transaction and polls every second.** Plenty for notifications at this scale; higher volume would batch jobs and use `LISTEN/NOTIFY`.
+- **`/api/health` is public** and shows record counts; in production it would be internal only.
 - **Notifications are in-app only.** Email or Slack would be another job type on the same queue.
-- **Updates are not real-time.** The UI polls (15 to 30 s) and refreshes on focus; push (WebSockets/SSE) is possible future work. Correctness doesn't depend on it: version checks catch anything stale.
-- **No UI tests.** Behaviour is tested at the API level, where the rules live. The UI was checked with a scripted multi-user browser run (claim race, edit conflict, approval, rejection, phone width), but that script is not part of the test suite.
-- **Dead jobs are inspected with SQL** (`SELECT * FROM outbox_jobs WHERE status = 'dead'`); there is no admin screen to retry them.
-- **The worker polls every second** rather than being woken by Postgres `LISTEN/NOTIFY`, so notifications can take up to a second to appear.
-- **Conflict resolution is manual.** A stale save is rejected with the current item; the user re-applies their change. Field-level merging is possible future work.
-- **Cookies are not marked `Secure` by default**, because the demo runs on plain `http://localhost`. Set `SECURE_COOKIES=true` behind HTTPS.
+
+## With another week
+
+1. Push updates (Server-Sent Events) so screens change the moment someone acts.
+2. SLA timers and escalation: overdue critical items notify the team lead.
+3. Company SSO, and team membership synced from the directory.
+4. An admin view for dead jobs, with retry.
+5. Email and Slack notifications through the existing outbox.
+6. Metrics and tracing: request latency, lock waits, job age.
