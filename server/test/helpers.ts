@@ -32,11 +32,11 @@ export async function login(app: ReturnType<typeof buildApp>, name: string): Pro
  */
 export async function as(app: ReturnType<typeof buildApp>, name: string) {
   const cookie = await login(app, name);
-  const call = (method: 'GET' | 'POST' | 'PATCH', url: string, payload?: object) =>
-    app.inject({ method, url, payload, headers: { cookie } });
+  const call = (method: 'GET' | 'POST' | 'PATCH', url: string, payload?: object, headers: Record<string, string> = {}) =>
+    app.inject({ method, url, payload, headers: { cookie, ...headers } });
   return {
     get: (url: string) => call('GET', url),
-    post: (url: string, body: object = {}) => call('POST', url, body),
+    post: (url: string, body: object = {}, headers: Record<string, string> = {}) => call('POST', url, body, headers),
     patch: (url: string, body: object) => call('PATCH', url, body),
     /** POST /api/items/:id/actions/:action */
     act: (id: number, action: string, body: object = {}) => call('POST', `/api/items/${id}/actions/${action}`, body),

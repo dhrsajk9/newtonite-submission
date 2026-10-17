@@ -9,6 +9,7 @@ import { currentUser, requireAuth } from '../auth/routes.js';
 import { findItem, listActivity, listItems } from './repository.js';
 import { addComment, createItem, editItem, performAction, present } from './service.js';
 import { WORKFLOW, type WorkflowAction } from './workflow.js';
+import { idempotent } from '../idempotency.js';
 
 const STATUSES = ['OPEN', 'IN_PROGRESS', 'AWAITING_APPROVAL', 'RESOLVED', 'CLOSED'] as const;
 const PRIORITIES = ['critical', 'high', 'medium', 'low'] as const;
@@ -95,9 +96,12 @@ export async function itemRoutes(app: FastifyInstance) {
     });
   });
 
+  // Create and comment accept an Idempotency-Key header: a retried request
+  // returns the original response instead of creating a duplicate.
   app.post('/api/items', async (request, reply) => {
-    const item = await createItem(currentUser(request), CreateBody.parse(request.body));
-    return reply.status(201).send(item);
+    const user = currentUser(request);
+    const input = CreateBody.parse(request.body);
+    return idempotent(request, reply, user.id, 201, (tx) => createItem(tx, user, input));
   });
 
   app.get('/api/items/:id', async (request) => {
@@ -126,7 +130,8 @@ export async function itemRoutes(app: FastifyInstance) {
   app.post('/api/items/:id/comments', async (request, reply) => {
     const { id } = IdParams.parse(request.params);
     const { body } = CommentBody.parse(request.body);
-    return reply.status(201).send(await addComment(currentUser(request), id, body));
+    const user = currentUser(request);
+    return idempotent(request, reply, user.id, 201, (tx) => addComment(tx, user, id, body));
   });
 
   // History, newest first, paginated (it grows without limit).

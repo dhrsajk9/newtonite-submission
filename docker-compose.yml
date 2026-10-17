@@ -29,5 +29,18 @@ services:
       db:
         condition: service_healthy   # wait until Postgres accepts connections
 
+  # Background worker: same image as the API, different command.
+  # It runs migrations too; the advisory lock in migrate.ts makes that safe
+  # even though the API container is migrating at the same moment.
+  worker:
+    build: ./server
+    command: ["sh", "-c", "npm run migrate && npm run worker"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/newtonite
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped   # if it crashes, Docker restarts it; unfinished jobs are retried
+
 volumes:
   db-data:

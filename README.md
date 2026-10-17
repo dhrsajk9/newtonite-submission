@@ -4,8 +4,8 @@ An internal tool for tracking operational work (customer issues, incidents,
 payment investigations, compliance tasks, approvals), with team-based
 permissions, a full activity history, and safe handling of concurrent edits.
 
-> Status: **Step 3: work item API, concurrency control, workflow and history.**
-> Later steps add idempotency keys, the background worker and notifications, and the UI.
+> Status: **Step 4: idempotency keys, background worker and notifications.**
+> The next step adds the UI.
 
 ## Running it
 
@@ -18,8 +18,13 @@ docker compose up --build
 Then open <http://localhost:3000/api/health>. You should see:
 
 ```json
-{"status":"ok","database":"reachable","counts":{"users":8,"teams":3,"work_items":5000}}
+{"status":"ok","database":"reachable","counts":{"users":8,"teams":3,"work_items":5000},
+ "jobs":{"pending":0,"dead":0,"oldest_pending_seconds":null}}
 ```
+
+Three containers run: **db** (Postgres), **api** (HTTP server) and **worker**
+(background jobs: notifications and housekeeping). `jobs.pending` shows whether
+the worker is keeping up; `jobs.dead` counts jobs that failed permanently.
 
 On startup the API container applies database migrations and seeds demo data.
 Both steps are safe to repeat, so restarting never duplicates data.
@@ -49,13 +54,23 @@ Tests focus on behaviour that would be dangerous if wrong, not on coverage:
 | `test/concurrency.test.ts` | 9 simultaneous claims → exactly one winner; stale edits rejected with 409; 5 simultaneous saves → one succeeds; failed requests leave no history |
 | `test/workflow.test.ts` | Invalid transitions (422); approval flow; four-eyes rule; reject needs a reason; ownership; assignment rules; `allowed_actions` per user |
 | `test/items.test.ts` | Validation; team scoping of lists; filters; text search; cursor pagination is complete and stable while data changes |
+| `test/idempotency.test.ts` | A retry returns the original response; 5 simultaneous submissions with one key create one item; a reused key with a different body is rejected; keys are per user; a failed request doesn't use up its key |
+| `test/worker.test.ts` | Notifications reach the right people (and never the actor); a failed action creates no job; a job run twice gives one notification; retry with backoff; partial writes undone; dead after 5 attempts; parallel workers never share a job; notifications API |
 
-The concurrency tests were checked by deliberately removing the row lock and the
-version check: the relevant tests fail without them and pass with them.
+The safety mechanisms were each checked by deliberately removing them (the row
+lock, the version check, the atomic idempotency insert, `SKIP LOCKED`, the job
+savepoint): in every case the matching test fails without it and passes with it.
 
 ## API
 
 All errors share one shape: `{ "error": { "code": "...", "message": "..." } }`.
+
+**Idempotency.** `POST /api/items` and `POST /api/items/:id/comments` accept an
+`Idempotency-Key` header (8–128 letters, digits, `-`, `_`). Send the same key on
+every retry of one user action: a repeat returns the original response (with
+`Idempotent-Replayed: true`) instead of creating a duplicate. Keys are per user
+and remembered for 24 hours. Workflow actions don't need one: a repeated claim is
+harmless, and every other action carries a `version`, so a repeat gets 409.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -70,6 +85,9 @@ All errors share one shape: `{ "error": { "code": "...", "message": "..." } }`.
 | POST | `/api/items/:id/comments` | `{ body }` → 201 |
 | GET | `/api/items/:id/activity` | history, newest first; `limit`, `cursor` |
 | GET | `/api/teams/:id/members` | for assignment pickers |
+| GET | `/api/notifications` | your latest notifications + `unreadCount`; `unread=true`, `limit` |
+| POST | `/api/notifications/:id/read` | mark one read (404 if it isn't yours) |
+| POST | `/api/notifications/read-all` | mark all read |
 | GET | `/api/health` | liveness + database check |
 
 ### Workflow
@@ -105,7 +123,20 @@ Status and assignee can only change through these actions, never through `PATCH`
 | 403 | you can see the item but may not do this |
 | 404 | not found, or not in your teams |
 | 409 | `VERSION_CONFLICT` (response includes the `current` item) or `ALREADY_CLAIMED` (includes who claimed it) |
-| 422 | breaks a business rule: `INVALID_TRANSITION`, `APPROVAL_REQUIRED`, `INVALID_ASSIGNEE`, `ITEM_CLOSED` |
+| 422 | breaks a business rule: `INVALID_TRANSITION`, `APPROVAL_REQUIRED`, `INVALID_ASSIGNEE`, `ITEM_CLOSED`, `IDEMPOTENCY_KEY_REUSED` |
+
+### Notifications
+
+| Event | Who is notified |
+|---|---|
+| assigned | the new assignee |
+| unassigned | the previous assignee |
+| approval requested | every lead of the team |
+| approved / rejected | whoever requested approval (rejection includes the reason) |
+| commented | the assignee and the creator |
+| resolved / closed / reopened | the assignee |
+
+The person who acted is never notified about their own action.
 
 ## Demo users
 
@@ -126,7 +157,7 @@ so permission rules can be demonstrated.
 ## Project layout
 
 ```
-docker-compose.yml        Postgres + API
+docker-compose.yml        Postgres + API + worker
 server/
   src/
     app.ts                builds the app: plugins, routes, central error handler
@@ -142,6 +173,12 @@ server/
       events.ts           activity history (written in the same transaction)
       repository.ts       queries, cursor pagination, timeline
     teams/                team members endpoint
+    notifications/        list / mark-read endpoints
+    idempotency.ts        Idempotency-Key handling, atomic with the request's work
+    worker/
+      index.ts            the worker process: polls the queue, runs housekeeping
+      queue.ts            job processing: SKIP LOCKED, retries with backoff, dead jobs
+      notify.ts           turns an activity event into notifications (idempotent)
     db/
       pool.ts             connection pool + withTransaction helper
       migrate.ts          applies migrations/*.sql in order, exactly once
@@ -186,5 +223,9 @@ The brief leaves much unspecified on purpose. Assumptions made so far:
 - **No user or team administration UI.** Users, teams and roles come from seed data.
 - **Lists have one sort order** (most recently updated first) and **no total count**. Counting every match is slow on large tables; the dashboard (a later step) uses targeted queues instead.
 - **Comments cannot be edited or deleted.** Intentional for an audit trail, but a real product might allow edits with history.
+- **Notifications are in-app only.** Email or Slack would be another job type on the same queue.
+- **Notifications are not real-time.** The UI polls; push (WebSockets/SSE) is possible future work.
+- **Dead jobs are inspected with SQL** (`SELECT * FROM outbox_jobs WHERE status = 'dead'`); there is no admin screen to retry them.
+- **The worker polls every second** rather than being woken by Postgres `LISTEN/NOTIFY`, so notifications can take up to a second to appear.
 - **Conflict resolution is manual.** A stale save is rejected with the current item; the user re-applies their change. Field-level merging is possible future work.
 - **Cookies are not marked `Secure` by default**, because the demo runs on plain `http://localhost`. Set `SECURE_COOKIES=true` behind HTTPS.

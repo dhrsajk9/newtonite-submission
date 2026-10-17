@@ -200,4 +200,66 @@ this does not happen with the cursor). Client-side filtering: ruled out by the b
 
 ---
 
-_More decisions are added as the project progresses: idempotency and the background worker._
+## 9. Idempotency keys recorded in the same transaction as the work
+
+**Context.** Users double-click, networks time out, and clients retry. A retried
+"create" must not create a second item.
+
+**Decision.** `POST /api/items` and comment creation accept an `Idempotency-Key`
+that the client generates once per user action. Inside the request's transaction
+the server inserts `(user, key, request fingerprint)` with `ON CONFLICT DO NOTHING`,
+does the work, stores the response, and commits. If the key already exists, the
+stored response is replayed. A simultaneous duplicate blocks on the uncommitted
+insert until the first transaction finishes, then replays its result. If the work
+fails, the key rolls back with it, so the client can retry. The same key with a
+different body is rejected (422). Keys are per user and deleted after 24 hours.
+
+**Alternatives considered.**
+- *Disabling the button:* still used, but it doesn't help with network retries,
+  refreshes or two tabs.
+- *Check for the key, then insert it (two steps):* a race. Two simultaneous
+  requests both see "no key"; a test fails when the code is changed to this.
+- *Store the key in a separate transaction before the work, marked "in progress":*
+  common, but a crash between the work and storing the response leaves a stuck
+  key, and needs an extra "in progress" state. One transaction avoids both.
+- *Uniqueness on business fields (e.g. title):* two genuinely different items can
+  share a title.
+
+**Trade-offs.** Only create and comment use keys. Workflow actions are already
+safe to repeat (claim is a no-op for the owner; others carry a version). Stored
+responses use some space until cleanup.
+
+---
+
+## 10. Transactional outbox and a separate worker for side effects
+
+**Context.** Changes should notify people, but sending inside the request would
+make a slow or failing notification slow or break the user's action, and a crash
+between "saved" and "sent" would lose the notification (or send one for a change
+that rolled back).
+
+**Decision.** When an event that notifies someone is recorded, a row is added to
+`outbox_jobs` **in the same transaction** as the change. A separate worker process
+takes one job at a time with `SELECT … FOR UPDATE SKIP LOCKED` (so several workers
+never take the same job), runs its handler inside a savepoint, and marks it done
+in the same transaction. On failure, the handler's writes are undone, the error
+is recorded, and the job is retried with exponential backoff (2 s, 4 s, 8 s…);
+after 5 attempts it is marked `dead` for a human to inspect. A crashed worker's
+transaction is rolled back by Postgres and the job is picked up again. Delivery is
+therefore at-least-once, so handlers are idempotent: notifications are unique per
+`(user, event)` and inserted with `ON CONFLICT DO NOTHING`. `/api/health` reports
+pending and dead job counts.
+
+**Alternatives considered.**
+- *Send inline in the request:* couples the user's action to the notification's
+  speed and success.
+- *Fire-and-forget promise / `setTimeout`:* lost on restart, no retries, no record.
+- *Redis/BullMQ, RabbitMQ, SQS:* built for high volume, but the job would live
+  outside the database transaction, so "save" and "enqueue" could disagree; an
+  outbox is still needed to bridge them.
+- *Exactly-once delivery:* not achievable across crashes for external effects;
+  at-least-once with idempotent handlers is the standard answer.
+
+**Trade-offs.** Notifications appear up to about a second later (polling). The
+queue shares the database, which is fine at this volume; at much higher volume the
+outbox would feed a dedicated broker. Dead jobs need manual attention.

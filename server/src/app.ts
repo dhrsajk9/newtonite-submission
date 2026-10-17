@@ -6,6 +6,7 @@ import { AppError } from './errors.js';
 import { authRoutes } from './auth/routes.js';
 import { itemRoutes } from './items/routes.js';
 import { teamRoutes } from './teams/routes.js';
+import { notificationRoutes } from './notifications/routes.js';
 
 // Builds the HTTP app without starting it, so tests can call routes directly
 // with `app.inject()` instead of opening a real port.
@@ -45,18 +46,25 @@ export function buildApp() {
     reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }),
   );
 
-  // Health check: proves the API is up and can reach the database.
+  // Health check: proves the API is up and can reach the database, and shows
+  // whether background jobs are keeping up (pending) or failing for good (dead).
   app.get('/api/health', async () => {
     const { rows } = await pool.query(`
       SELECT (SELECT count(*) FROM users)::int       AS users,
              (SELECT count(*) FROM teams)::int       AS teams,
              (SELECT count(*) FROM work_items)::int  AS work_items`);
-    return { status: 'ok', database: 'reachable', counts: rows[0] };
+    const jobs = await pool.query(`
+      SELECT count(*) FILTER (WHERE status = 'pending')::int AS pending,
+             count(*) FILTER (WHERE status = 'dead')::int    AS dead,
+             EXTRACT(EPOCH FROM now() - min(created_at) FILTER (WHERE status = 'pending'))::int AS oldest_pending_seconds
+        FROM outbox_jobs`);
+    return { status: 'ok', database: 'reachable', counts: rows[0], jobs: jobs.rows[0] };
   });
 
   app.register(authRoutes);
   app.register(itemRoutes);
   app.register(teamRoutes);
+  app.register(notificationRoutes);
 
   return app;
 }

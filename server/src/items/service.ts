@@ -229,7 +229,7 @@ export function performAction(user: AuthUser, id: number, actionName: WorkflowAc
       case 'reject':
         return {
           set: { status: t.to, approval_requested_by: null },
-          events: [{ type: 'rejected', payload: { ...base, reason: input.reason } }],
+          events: [{ type: 'rejected', payload: { ...base, reason: input.reason, requested_by: item.approval_requested_by } }],
         };
 
       case 'resolve':
@@ -262,36 +262,36 @@ export interface NewItem {
   due_at: string | null;
 }
 
-export async function createItem(user: AuthUser, input: NewItem) {
+/**
+ * Creating and commenting take the caller's transaction (`tx`), so the route can
+ * wrap them in an idempotency check that commits atomically with the work
+ * (see idempotency.ts).
+ */
+export async function createItem(tx: PoolClient, user: AuthUser, input: NewItem) {
   authorize(user, 'item.create', { team_id: input.team_id }, 'Team');
-  const item = await withTransaction(async (tx) => {
-    const { rows } = await tx.query<{ id: number }>(
-      `INSERT INTO work_items (team_id, title, description, type, priority, next_step, due_at, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-      [input.team_id, input.title, input.description, input.type, input.priority, input.next_step, input.due_at, user.id],
-    );
-    const id = rows[0].id;
-    await recordEvent(tx, id, user.id, { type: 'created', payload: { title: input.title } });
-    return (await findItem(tx, id))!;
-  });
-  return present(user, item);
+  const { rows } = await tx.query<{ id: number }>(
+    `INSERT INTO work_items (team_id, title, description, type, priority, next_step, due_at, created_by)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [input.team_id, input.title, input.description, input.type, input.priority, input.next_step, input.due_at, user.id],
+  );
+  const id = rows[0].id;
+  await recordEvent(tx, id, user.id, { type: 'created', payload: { title: input.title } });
+  return present(user, (await findItem(tx, id))!);
 }
 
-export async function addComment(user: AuthUser, itemId: number, body: string) {
-  return withTransaction(async (tx) => {
-    // Comments don't change the item, so they don't bump its version and never
-    // cause edit conflicts. FOR SHARE just stops the item vanishing mid-insert.
-    const { rows } = await tx.query('SELECT team_id FROM work_items WHERE id = $1 FOR SHARE', [itemId]);
-    if (!rows[0] || !user.roles.has(rows[0].team_id)) throw new NotFoundError();
-    authorize(user, 'item.comment', rows[0]);
+export async function addComment(tx: PoolClient, user: AuthUser, itemId: number, body: string) {
+  // Comments don't change the item, so they don't bump its version and never
+  // cause edit conflicts. FOR SHARE just stops the item vanishing mid-insert.
+  const { rows } = await tx.query('SELECT team_id FROM work_items WHERE id = $1 FOR SHARE', [itemId]);
+  if (!rows[0] || !user.roles.has(rows[0].team_id)) throw new NotFoundError();
+  authorize(user, 'item.comment', rows[0]);
 
-    const c = await tx.query(
-      `INSERT INTO comments (work_item_id, author_id, body) VALUES ($1, $2, $3)
-       RETURNING id, body, created_at`,
-      [itemId, user.id, body],
-    );
-    const comment = c.rows[0];
-    await recordEvent(tx, itemId, user.id, { type: 'commented', payload: { comment_id: comment.id, body } });
-    return { ...comment, work_item_id: itemId, author_id: user.id, author_name: user.name };
-  });
+  const c = await tx.query(
+    `INSERT INTO comments (work_item_id, author_id, body) VALUES ($1, $2, $3)
+     RETURNING id, body, created_at`,
+    [itemId, user.id, body],
+  );
+  const comment = c.rows[0];
+  await recordEvent(tx, itemId, user.id, { type: 'commented', payload: { comment_id: comment.id, body } });
+  return { ...comment, work_item_id: itemId, author_id: user.id, author_name: user.name };
 }
