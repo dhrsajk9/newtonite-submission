@@ -5,6 +5,7 @@ import { pool } from './db/pool.js';
 import { AppError } from './errors.js';
 import { authRoutes } from './auth/routes.js';
 import { itemRoutes } from './items/routes.js';
+import { teamRoutes } from './teams/routes.js';
 
 // Builds the HTTP app without starting it, so tests can call routes directly
 // with `app.inject()` instead of opening a real port.
@@ -55,6 +56,7 @@ export function buildApp() {
 
   app.register(authRoutes);
   app.register(itemRoutes);
+  app.register(teamRoutes);
 
   return app;
 }

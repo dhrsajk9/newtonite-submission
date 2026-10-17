@@ -118,5 +118,86 @@ scope; a production deployment would add CSRF tokens and SSO.
 
 ---
 
-_More decisions are added as the project progresses: concurrency control,
-idempotency, and the background worker._
+## 6. Concurrency: version numbers across think-time, row locks within a request
+
+**Context.** Two people can claim the same item at the same moment, and people
+save forms they loaded minutes ago. Last-write-wins would silently lose work.
+
+**Decision.** Two mechanisms, for two timescales:
+- **Across user think-time (seconds to minutes): optimistic locking.** Every item
+  has a `version`. Edits and workflow actions must send the version the user was
+  looking at; if it has changed, the request fails with `409 VERSION_CONFLICT` and
+  the response includes the current item so the UI can show what changed.
+- **Within a request (milliseconds): a row lock.** Every change runs through one
+  function, `mutateItem`, which starts a transaction and takes `SELECT … FOR UPDATE`
+  on the row before checking visibility, version, permission and workflow state.
+  A concurrent request for the same item waits a few milliseconds, then sees the
+  updated row. This makes claiming atomic: the second claimer gets
+  `409 ALREADY_CLAIMED` with the winner's name, and a repeated claim by the winner
+  succeeds harmlessly.
+
+**Alternatives considered.**
+- *Last write wins:* simplest, loses data silently.
+- *Pessimistic "editing" locks held while a user has a form open:* locks get stuck
+  on closed tabs and lost connections, needing timeouts and force-unlock.
+- *Version check in application code without a lock:* itself a check-then-write
+  race. Removing the row lock makes the "five simultaneous saves" test fail even
+  with the version check present.
+- *A single conditional `UPDATE … WHERE version = $v`:* also correct, but
+  permission and workflow rules would then have to be re-expressed in SQL or
+  checked against a possibly stale read. Locking first lets all rules run in
+  TypeScript against the current row.
+
+**Trade-offs.** Requests for the same item are serialised (briefly), which is fine
+for human-driven traffic and harmless for different items. Users occasionally see
+a conflict and must re-apply their change. Locks are never held across network
+calls or user think-time, so they cannot get stuck.
+
+---
+
+## 7. Workflow as a data table, changed only through explicit actions
+
+**Context.** Requests may need approval before moving forward, and items should
+not jump to arbitrary states.
+
+**Decision.** The state machine is a table in `workflow.ts`: each action lists the
+statuses it may start from, the status it leads to, and the permission it needs.
+Status and assignee change only via `POST /api/items/:id/actions/:action`, never
+through `PATCH` (which rejects unknown fields). Business rules sit beside it:
+payment and compliance items require approval, the requester cannot approve
+(four-eyes), rejecting and reopening require a reason that is kept in the history.
+Every item response includes `allowed_actions` for the current user, computed from
+the same rules, so the UI shows only what the server would accept. The server
+still re-checks everything on every request. The database independently enforces
+the invariants it can (e.g. an `IN_PROGRESS` item has an assignee; an `OPEN` item does not).
+
+**Alternatives considered.** A generic `PATCH { status }` (any client could skip
+approval); a state-machine library (more machinery than nine transitions need).
+
+**Trade-offs.** One endpoint per action means slightly more API surface, but each
+action is individually authorised, validated and recorded with a meaningful
+history entry. Adding a status or action is a one-line table change plus tests.
+
+---
+
+## 8. Keyset (cursor) pagination and server-side filtering
+
+**Context.** Tens of thousands of items; the browser must never load them all.
+
+**Decision.** Lists are filtered, searched and paginated in SQL, always scoped to
+the user's teams. Pages are ordered by `(updated_at DESC, id DESC)`, and the cursor
+is the last row's key. Indexes match these queries (the common filtered list is
+answered from an index in about 3 ms on 5,000 items). The cursor carries the
+timestamp as Postgres text, because JavaScript dates drop microseconds and would
+make the cursor skip rows.
+
+**Alternatives considered.** `OFFSET` pagination: slower on deep pages and shows
+duplicates or skips rows when data changes between pages (a test demonstrates
+this does not happen with the cursor). Client-side filtering: ruled out by the brief.
+
+**Trade-offs.** No "jump to page 37" and no exact total count; the UI offers
+"load more" instead. One fixed sort order for now.
+
+---
+
+_More decisions are added as the project progresses: idempotency and the background worker._

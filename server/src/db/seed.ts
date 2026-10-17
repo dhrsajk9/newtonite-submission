@@ -23,7 +23,9 @@ const USERS: { name: string; email: string; roles: Partial<Record<(typeof TEAMS)
   { name: 'Meera Iyer',   email: 'meera@newtonite.test',  roles: { Payments: 'member', Engineering: 'member' } },
   { name: 'Kabir Shah',   email: 'kabir@newtonite.test',  roles: { 'Customer Support': 'lead' } },
   { name: 'Priya Nair',   email: 'priya@newtonite.test',  roles: { 'Customer Support': 'member', Payments: 'viewer' } },
-  { name: 'Arjun Mehta',  email: 'arjun@newtonite.test',  roles: { Engineering: 'lead', Payments: 'viewer' } },
+  // Payments needs two leads: with the four-eyes rule, a lone lead's own approval
+  // requests could never be approved.
+  { name: 'Arjun Mehta',  email: 'arjun@newtonite.test',  roles: { Engineering: 'lead', Payments: 'lead' } },
   { name: 'Neha Gupta',   email: 'neha@newtonite.test',   roles: { Engineering: 'member', 'Customer Support': 'member' } },
   { name: 'Vikram Singh', email: 'vikram@newtonite.test', roles: { Engineering: 'viewer' } },
 ];
@@ -103,8 +105,8 @@ export async function seed(itemCount = config.seedItemCount): Promise<boolean> {
         const status = weighted<string>([['OPEN', 25], ['IN_PROGRESS', 20], ['AWAITING_APPROVAL', 5], ['RESOLVED', 15], ['CLOSED', 35]]);
         const priority = weighted<string>([['critical', 5], ['high', 20], ['medium', 45], ['low', 30]]);
         const creator = pick(workers[team]);
-        // Open items are mostly unassigned; anything being worked on has an owner.
-        const assignee = status === 'OPEN' ? (rand() < 0.2 ? pick(workers[team]) : null) : pick(workers[team]);
+        // Open items are unassigned (enforced by the database); anything else has an owner.
+        const assignee = status === 'OPEN' ? null : pick(workers[team]);
         const requester = status === 'AWAITING_APPROVAL' ? assignee : null;
         const createdAt = new Date(now - rand() * 90 * DAY);
         const updatedAt = new Date(Math.min(now, createdAt.getTime() + rand() * 20 * DAY));
