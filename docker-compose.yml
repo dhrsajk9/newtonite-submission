@@ -20,6 +20,8 @@ services:
     build: ./server
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/newtonite
+      # Used only by `docker compose run --rm api npm test` (a separate, disposable database)
+      TEST_DATABASE_URL: postgres://postgres:postgres@db:5432/newtonite_test
       PORT: "3000"
     ports:
       - "3000:3000"

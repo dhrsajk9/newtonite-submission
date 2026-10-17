@@ -1,6 +1,10 @@
 import pg from 'pg';
 import { config } from '../config.js';
 
+// Postgres BIGINT (type 20) arrives as a string by default, because it can exceed
+// JavaScript's safe integer range. Our ids and counts never will, so parse them as numbers.
+pg.types.setTypeParser(20, (value) => Number(value));
+
 // One shared connection pool for the whole process.
 export const pool = new pg.Pool({ connectionString: config.databaseUrl, max: 10 });
 

@@ -68,5 +68,55 @@ return, every query that matters for correctness is visible and reviewable.
 
 ---
 
+## 4. Team-scoped roles, enforced in one server-side function
+
+**Context.** People belong to several teams with different responsibilities in
+each. Hiding buttons in the UI is not access control: anyone can call the API directly.
+
+**Decision.** Roles (`viewer`, `member`, `lead`) live on the team membership, not
+the user. Every route calls `authorize(user, action, item)` from `permissions.ts`,
+which combines a role → actions table with item-specific rules (members may only
+change items assigned to them; a lead cannot approve their own approval request).
+Users outside an item's team receive **404, not 403**. List queries filter by the
+user's teams in SQL, never after fetching.
+
+**Alternatives considered.**
+- *Global roles (admin/user):* cannot express "lead in Payments, viewer in Engineering".
+- *Policy engine (OPA, Casbin):* powerful, but heavy for about ten rules; a pure
+  function is easier to test exhaustively and to explain.
+- *403 for other teams' items:* accurate, but confirms the item exists, which
+  leaks information (e.g. that a compliance investigation is open).
+
+**Trade-offs.** No cross-team items and no per-item sharing. Roles are loaded on
+every request (one small indexed query) so role changes take effect immediately,
+at the cost of a little latency compared with caching them in a token.
+
+---
+
+## 5. Server-side sessions in an httpOnly cookie, not JWTs
+
+**Context.** The app needs simple login for seeded users. Authentication is not
+the focus of the brief, but it must not be unsafe.
+
+**Decision.** On login, generate a random 256-bit token, store only its SHA-256
+hash in a `sessions` table, and send the token in an `httpOnly`, `SameSite=Lax`
+cookie. Logout deletes the row. Wrong email and wrong password return the same
+error and take the same time (a bcrypt comparison runs either way).
+
+**Alternatives considered.**
+- *JWT in localStorage:* readable by any injected script (XSS), and cannot be
+  revoked before it expires.
+- *JWT in a cookie:* safer, but still not revocable without a denylist, which is
+  a session table again.
+- *SSO (OAuth/OIDC):* the right production answer, but setup would consume time
+  the brief wants spent elsewhere, and reviewers would need accounts.
+
+**Trade-offs.** One extra query per request to look up the session (cheap,
+indexed by primary key). In exchange, sessions can be revoked instantly and roles
+are always current. `SameSite=Lax` plus a JSON-only API covers CSRF for this
+scope; a production deployment would add CSRF tokens and SSO.
+
+---
+
 _More decisions are added as the project progresses: concurrency control,
-authorization model, idempotency, and the background worker._
+idempotency, and the background worker._

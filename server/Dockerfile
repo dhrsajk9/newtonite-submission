@@ -5,8 +5,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-COPY tsconfig.json ./
+COPY tsconfig.json vitest.config.ts ./
 COPY src ./src
+COPY test ./test
 
 EXPOSE 3000
 # Apply migrations and seed data (both are safe to re-run), then start the API.

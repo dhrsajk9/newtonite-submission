@@ -1,10 +1,48 @@
-import Fastify from 'fastify';
+import Fastify, { type FastifyError } from 'fastify';
+import cookie from '@fastify/cookie';
+import { ZodError } from 'zod';
 import { pool } from './db/pool.js';
+import { AppError } from './errors.js';
+import { authRoutes } from './auth/routes.js';
+import { itemRoutes } from './items/routes.js';
 
 // Builds the HTTP app without starting it, so tests can call routes directly
 // with `app.inject()` instead of opening a real port.
 export function buildApp() {
   const app = Fastify({ logger: process.env.NODE_ENV !== 'test' });
+
+  app.register(cookie);
+
+  // ─── Central error handler ────────────────────────────────────────────────
+  // Routes throw; this turns every error into the same JSON shape.
+  app.setErrorHandler((err: FastifyError | Error, request, reply) => {
+    if (err instanceof AppError) {
+      return reply
+        .status(err.statusCode)
+        .send({ error: { code: err.code, message: err.message, ...err.details } });
+    }
+    if (err instanceof ZodError) {
+      return reply.status(400).send({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'The request is invalid.',
+          fields: err.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
+        },
+      });
+    }
+    // Errors Fastify raises itself (malformed JSON, unsupported content type, ...)
+    const status = (err as FastifyError).statusCode;
+    if (status && status >= 400 && status < 500) {
+      return reply.status(status).send({ error: { code: 'BAD_REQUEST', message: err.message } });
+    }
+    // Anything else is a bug: log everything, reveal nothing.
+    request.log.error(err);
+    return reply.status(500).send({ error: { code: 'INTERNAL', message: 'Something went wrong.' } });
+  });
+
+  app.setNotFoundHandler((_request, reply) =>
+    reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }),
+  );
 
   // Health check: proves the API is up and can reach the database.
   app.get('/api/health', async () => {
@@ -14,6 +52,9 @@ export function buildApp() {
              (SELECT count(*) FROM work_items)::int  AS work_items`);
     return { status: 'ok', database: 'reachable', counts: rows[0] };
   });
+
+  app.register(authRoutes);
+  app.register(itemRoutes);
 
   return app;
 }

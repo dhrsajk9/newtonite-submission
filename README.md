@@ -4,8 +4,8 @@ An internal tool for tracking operational work (customer issues, incidents,
 payment investigations, compliance tasks, approvals), with team-based
 permissions, a full activity history, and safe handling of concurrent edits.
 
-> Status: **Step 1 — foundation** (schema, migrations, seed data, health check).
-> Later steps add the API, authorization, concurrency handling, background worker, and UI.
+> Status: **Step 2: login and authorization.**
+> Later steps add the work item API, concurrency handling, the background worker, and the UI.
 
 ## Running it
 
@@ -25,6 +25,48 @@ On startup the API container applies database migrations and seeds demo data.
 Both steps are safe to repeat, so restarting never duplicates data.
 
 To start again with an empty database: `docker compose down -v` (the `-v` deletes the data volume).
+
+## Running the tests
+
+Tests run against a real Postgres, in a separate `newtonite_test` database that is
+wiped and rebuilt on every run. Your demo data is never touched.
+
+```bash
+docker compose up -d db                 # if it isn't already running
+docker compose run --rm --build api npm test
+```
+
+Or, with Node 22+ installed: `cd server && npm install && npm test`
+(uses `localhost:5432`, which Docker Compose exposes).
+
+Tests focus on behaviour that would be dangerous if wrong, not on coverage:
+
+| File | What it proves |
+|---|---|
+| `test/permissions.test.ts` | The full role × action matrix; members can only change their own items; four-eyes rule; roles don't leak across teams |
+| `test/auth.test.ts` | Login, httpOnly cookie, identical errors for wrong password vs unknown email, logout revokes the session |
+| `test/authorization.test.ts` | Calling the API directly: outsiders get the same 404 as for a non-existent item |
+
+## API
+
+All errors share one shape: `{ "error": { "code": "...", "message": "..." } }`.
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/api/auth/login` | `{ email, password }` → user + teams/roles; sets session cookie |
+| POST | `/api/auth/logout` | revokes the session |
+| GET | `/api/auth/me` | current user + teams/roles |
+| GET | `/api/items/:id` | 404 if it doesn't exist **or** belongs to a team you're not in |
+| GET | `/api/health` | liveness + database check |
+
+| Status | Meaning |
+|---|---|
+| 400 | malformed request (`VALIDATION_ERROR`, with the bad fields listed) |
+| 401 | not logged in |
+| 403 | you can see the item but may not do this |
+| 404 | not found, or not in your teams |
+| 409 | conflict with the current state (later steps) |
+| 422 | breaks a business rule (later steps) |
 
 ## Demo users
 
@@ -48,15 +90,21 @@ so permission rules can be demonstrated.
 docker-compose.yml        Postgres + API
 server/
   src/
-    app.ts                HTTP routes (built without listening, so tests can call them)
+    app.ts                builds the app: plugins, routes, central error handler
     index.ts              starts the server
     config.ts             settings from environment variables
+    errors.ts             typed errors → consistent JSON error responses
+    permissions.ts        ALL authorization rules: can() / authorize()
+    auth/                 login, logout, sessions, requireAuth guard
+    items/                work item routes and queries
     db/
       pool.ts             connection pool + withTransaction helper
       migrate.ts          applies migrations/*.sql in order, exactly once
       seed.ts             demo teams, users and 5,000 work items
       migrations/
         001_init.sql      the schema
+        002_sessions.sql  login sessions
+  test/                   integration + unit tests (real Postgres)
 ENGINEERING_DECISIONS.md  key design decisions and trade-offs
 ```
 
@@ -84,4 +132,7 @@ The brief leaves much unspecified on purpose. Assumptions made so far:
 
 ## Known limitations
 
-_Filled in as the project progresses._
+- **No login rate limiting or account lockout.** Production would rate-limit `/api/auth/login` per IP and per account.
+- **Expired sessions are ignored but not deleted.** A periodic cleanup job would remove them.
+- **No user or team administration UI.** Users, teams and roles come from seed data.
+- **Cookies are not marked `Secure` by default**, because the demo runs on plain `http://localhost`. Set `SECURE_COOKIES=true` behind HTTPS.
