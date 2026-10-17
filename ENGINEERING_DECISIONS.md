@@ -263,3 +263,41 @@ pending and dead job counts.
 **Trade-offs.** Notifications appear up to about a second later (polling). The
 queue shares the database, which is fine at this volume; at much higher volume the
 outbox would feed a dedicated broker. Dead jobs need manual attention.
+
+---
+
+## 11. Frontend: server state in a query cache, optimistic only where it's safe
+
+**Context.** The UI must stay consistent with server decisions it cannot predict:
+someone else may claim, edit or approve at any moment.
+
+**Decision.** React with TanStack Query. Server data lives only in the query cache
+(never copied into hand-written global state); filters live in the URL; form drafts
+live in component state. Every server error arrives as a typed `ApiError` with the
+API's `code`, so screens react to meaning (`ALREADY_CLAIMED`, `VERSION_CONFLICT`),
+not to status numbers.
+- **Claim is optimistic:** the page shows you as owner at once, then replaces that
+  with the server's answer; on 409 it rolls back and names the winner.
+- **Edits are not optimistic:** the form keeps the version it started from. On 409
+  it shows what the other person changed and offers "keep my changes on top of
+  theirs" (re-sending only the fields this user changed) or "discard".
+- **Which buttons appear** comes from the server's `allowed_actions`.
+- **Freshness** comes from polling and refetch-on-focus; correctness comes from
+  versions, so a stale screen can never cause a silent overwrite.
+- **One origin:** the API serves the built UI, so the session cookie works with no
+  CORS configuration.
+
+**Alternatives considered.**
+- *Redux or another global store for server data:* hand-written caching,
+  invalidation and loading states, and a second copy of the truth.
+- *Optimistic updates everywhere:* attractive, but an optimistic edit that later
+  conflicts would show the user something that never happened; claim is safe
+  because its rollback is simple and its outcome is announced.
+- *WebSockets:* faster updates, more moving parts (reconnection, fan-out); a
+  polish item, since it improves speed, not correctness.
+- *A component library:* faster to start, but generic; plain CSS with one design
+  system (priority as the only strong colour) stays small and readable.
+
+**Trade-offs.** Polling means other people's changes appear within 15 to 30
+seconds rather than instantly. Field-level merging is manual (the user chooses),
+not automatic.

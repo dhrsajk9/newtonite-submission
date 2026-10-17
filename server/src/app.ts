@@ -1,5 +1,9 @@
 import Fastify, { type FastifyError } from 'fastify';
 import cookie from '@fastify/cookie';
+import fastifyStatic from '@fastify/static';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { config } from './config.js';
 import { ZodError } from 'zod';
 import { pool } from './db/pool.js';
 import { AppError } from './errors.js';
@@ -7,6 +11,7 @@ import { authRoutes } from './auth/routes.js';
 import { itemRoutes } from './items/routes.js';
 import { teamRoutes } from './teams/routes.js';
 import { notificationRoutes } from './notifications/routes.js';
+import { dashboardRoutes } from './dashboard/routes.js';
 
 // Builds the HTTP app without starting it, so tests can call routes directly
 // with `app.inject()` instead of opening a real port.
@@ -42,9 +47,24 @@ export function buildApp() {
     return reply.status(500).send({ error: { code: 'INTERNAL', message: 'Something went wrong.' } });
   });
 
-  app.setNotFoundHandler((_request, reply) =>
-    reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found.' } }),
-  );
+  // The built web app (when present) is served from the same origin as the API,
+  // so the session cookie just works and no CORS setup is needed.
+  // Files are looked up when requested (the default `wildcard: true`), so a rebuilt
+  // web app is picked up without restarting the server.
+  const hasWebApp = existsSync(path.join(config.publicDir, 'index.html'));
+  if (hasWebApp) app.register(fastifyStatic, { root: path.resolve(config.publicDir) });
+
+  app.setNotFoundHandler((request, reply) => {
+    // Browser routes like /items/42 are handled by the web app: send it index.html.
+    // A missing FILE (anything with an extension, e.g. /assets/old.js) gets a real
+    // 404 instead, so the browser never tries to run an HTML page as JavaScript.
+    const pathname = request.url.split('?')[0];
+    const looksLikeFile = /\.[a-z0-9]+$/i.test(pathname);
+    if (hasWebApp && request.method === 'GET' && !pathname.startsWith('/api/') && !looksLikeFile) {
+      return reply.sendFile('index.html');
+    }
+    return reply.status(404).send({ error: { code: 'NOT_FOUND', message: 'Route not found.' } });
+  });
 
   // Health check: proves the API is up and can reach the database, and shows
   // whether background jobs are keeping up (pending) or failing for good (dead).
@@ -65,6 +85,7 @@ export function buildApp() {
   app.register(itemRoutes);
   app.register(teamRoutes);
   app.register(notificationRoutes);
+  app.register(dashboardRoutes);
 
   return app;
 }

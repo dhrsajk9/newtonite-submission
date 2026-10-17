@@ -1,4 +1,5 @@
 # Run everything with:  docker compose up --build
+# Then open http://localhost:3000
 services:
   db:
     image: postgres:16-alpine
@@ -17,7 +18,7 @@ services:
       retries: 20
 
   api:
-    build: ./server
+    build: { context: ., dockerfile: server/Dockerfile }   # also builds the web app
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/newtonite
       # Used only by `docker compose run --rm api npm test` (a separate, disposable database)
@@ -33,7 +34,7 @@ services:
   # It runs migrations too; the advisory lock in migrate.ts makes that safe
   # even though the API container is migrating at the same moment.
   worker:
-    build: ./server
+    build: { context: ., dockerfile: server/Dockerfile }
     command: ["sh", "-c", "npm run migrate && npm run worker"]
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/newtonite

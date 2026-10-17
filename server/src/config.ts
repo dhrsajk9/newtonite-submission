@@ -8,6 +8,8 @@ export const config = {
   // filtering and pagination happen on the server, not in the browser.
   seedItemCount: Number(process.env.SEED_ITEM_COUNT ?? 5000),
   sessionTtlHours: 12,
+  // Where the built web app lives (copied there by the Dockerfile).
+  publicDir: process.env.PUBLIC_DIR ?? 'public',
   // Cookies marked Secure are only sent over HTTPS. Off for local http://localhost.
   secureCookies: process.env.SECURE_COOKIES === 'true',
 };
