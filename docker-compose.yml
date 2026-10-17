@@ -1,0 +1,31 @@
+# Run everything with:  docker compose up --build
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: newtonite
+    ports:
+      - "5432:5432"          # exposed so you can inspect data and run tests from your machine
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d newtonite"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./server
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/newtonite
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy   # wait until Postgres accepts connections
+
+volumes:
+  db-data:
