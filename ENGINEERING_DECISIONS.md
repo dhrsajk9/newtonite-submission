@@ -332,8 +332,9 @@ not to status numbers.
   because its rollback is simple and its outcome is announced.
 - *WebSockets:* faster updates, more moving parts (reconnection, fan-out); a
   polish item, since it improves speed, not correctness.
-- *A component library:* faster to start, but generic; plain CSS with one design
-  system (priority as the only strong colour) stays small and readable.
+- *A component library:* faster to start, but generic; plain CSS with one small design
+  system (dark surfaces, one blue accent for actions, distinct colours for priority)
+  stays small and readable.
 
 **Trade-offs.** Polling means other people's changes appear within 15 to 30
 seconds rather than instantly. Field-level merging is manual (the user chooses),

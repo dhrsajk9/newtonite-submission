@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api, type Me, type Queue } from '../api';
 import { ItemRow } from '../components/Bits';
+import { SplitView } from '../components/SplitView';
 
 interface QueueSpec {
   key: 'mine' | 'approvals' | 'unclaimed' | 'overdue';
@@ -44,15 +45,17 @@ export function Dashboard({ me }: { me: Me }) {
   const { data, isPending, error } = useQuery({ queryKey: ['dashboard'], queryFn: api.dashboard, refetchInterval: 30_000 });
 
   return (
-    <div className="page">
-      <h1>Needs attention</h1>
-      {error && <p className="form-error" role="alert">Couldn't load your queues. {error.message}</p>}
-      <div className="queues">
-        {QUEUES.filter((q) => q.show(me)).map((q) => (
-          <QueueSection key={q.key} spec={q} queue={data?.[q.key]} loading={isPending} />
-        ))}
+    <SplitView me={me}>
+      <div className="page">
+        <h1>Needs attention</h1>
+        {error && <p className="form-error" role="alert">Couldn't load your queues. {error.message}</p>}
+        <div className="queues">
+          {QUEUES.filter((q) => q.show(me)).map((q) => (
+            <QueueSection key={q.key} spec={q} queue={data?.[q.key]} loading={isPending} />
+          ))}
+        </div>
       </div>
-    </div>
+    </SplitView>
   );
 }
 

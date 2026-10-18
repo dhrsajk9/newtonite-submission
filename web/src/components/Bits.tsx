@@ -2,6 +2,7 @@
 import { useCallback, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
 import type { Priority, Status, WorkItem } from '../api';
+import { useItemHref, useSelectedItemId } from '../split';
 import { formatDate, isOverdue, PRIORITY_LABEL, STATUS_LABEL, TYPE_LABEL } from '../format';
 
 export function StatusBadge({ status }: { status: Status }) {
@@ -30,9 +31,11 @@ export function DueDate({ item }: { item: Pick<WorkItem, 'due_at' | 'status'> })
 
 /** One work item in a list. The coloured bar on the left encodes priority. */
 export function ItemRow({ item, showTeam = true, showAssignee = true }: { item: WorkItem; showTeam?: boolean; showAssignee?: boolean }) {
+  const href = useItemHref();           // the side panel on wide screens, the full page otherwise
+  const selected = useSelectedItemId() === item.id;
   return (
     <li>
-      <Link to={`/items/${item.id}`} className={`row spine-${item.priority}`}>
+      <Link to={href(item.id)} className={`row spine-${item.priority}`} aria-current={selected ? 'true' : undefined}>
         <span className="row-main">
           <span className="row-title">{item.title}</span>
           <span className="row-sub">

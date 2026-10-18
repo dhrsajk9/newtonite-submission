@@ -114,3 +114,30 @@ test("a viewer sees no actions, and another team's item looks like it doesn't ex
   await vikram.goto(`/items/${id}`); // Vikram is not in Payments at all
   await expect(vikram.getByRole('heading', { name: 'Item not found' })).toBeVisible();
 });
+
+test('on a wide screen, items open in a side panel and the list stays put', async ({ browser }) => {
+  const asha = await (await browser.newContext({ viewport: { width: 1600, height: 900 } })).newPage();
+  await asha.goto('/');
+  await asha.getByRole('button', { name: /Asha/ }).click();
+  await asha.getByRole('button', { name: 'Log in' }).click();
+  await expect(asha.getByText('Select an item to see its details here.')).toBeVisible();
+
+  // Open an unclaimed item: it appears beside the list, the URL records it, the row is highlighted.
+  const row = asha.locator('section.queue-unclaimed .row').first();
+  const title = await row.locator('.row-title').innerText();
+  await row.click();
+  await expect(asha).toHaveURL(/\?item=\d+/);
+  await expect(asha.locator('.split-panel h1')).toHaveText(title);
+  await expect(row).toHaveAttribute('aria-current', 'true');
+  await expect(asha.getByRole('heading', { name: 'Needs attention' })).toBeVisible(); // still on the list
+
+  // Actions work from the panel exactly as on the full page.
+  await asha.locator('.split-panel').getByRole('button', { name: 'Claim' }).click();
+  await expect(asha.locator('.split-panel .facts')).toContainText('Asha Rao');
+
+  // Closing returns to the empty panel; the back button reopens the item.
+  await asha.getByRole('link', { name: 'Close item panel' }).click();
+  await expect(asha.getByText('Select an item to see its details here.')).toBeVisible();
+  await asha.goBack();
+  await expect(asha.locator('.split-panel h1')).toHaveText(title);
+});

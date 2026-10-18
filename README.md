@@ -168,7 +168,7 @@ docker compose run --rm --build api npm test
 | `items.test.ts` | Validation; lists only show your teams; filters; search; pagination visits every item once and stays stable while data changes |
 | `dashboard.test.ts` | Approval requests reach other leads, never the requester; each queue contains only what it claims to |
 
-### Browser tests (6)
+### Browser tests (7)
 
 End-to-end runs in Chromium, with several people logged in at once. They run
 against the running app, so start it first (`docker compose up`), then:
@@ -181,8 +181,8 @@ npm test
 ```
 
 They cover: the claim race, the edit conflict, a create request delivered twice,
-rejection needing a reason, a viewer's and an outsider's view, and logging out
-then in as someone else.
+rejection needing a reason, a viewer's and an outsider's view, logging out then in
+as someone else, and the wide-screen split view.
 
 ---
 
@@ -195,6 +195,7 @@ then in as someone else.
 | **Item** | Workflow track; why it exists and next step; your available actions; edit form; history and comments. |
 | **New item** | Creates an item; the form carries an idempotency key, so a duplicate submission creates it once. |
 | **Bell** | Unread notifications, refreshed every 15 seconds. |
+| **Split view** | On wide screens (1360 px and up), clicking an item in a list opens it in a panel on the right while the list stays in place. The open item is in the URL (`?item=42`), so back, reload and shared links keep it. Narrower screens open the full item page as before. |
 
 - Only the actions the server lists in `allowed_actions` are shown, and the server re-checks every request.
 - Screens refresh every 15–30 s and when the window regains focus. Correctness does not depend on this: versions catch anything stale.
@@ -305,7 +306,7 @@ web/
                           WorkflowTrack, NotificationBell, PromptDialog, Toast
     pages/                Login, Dashboard, ItemList, ItemDetail, NewItem
     styles.css            the whole visual design
-e2e/                      6 browser tests (Playwright)
+e2e/                      7 browser tests (Playwright)
 ```
 
 ## Running without Docker
